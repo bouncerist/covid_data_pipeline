@@ -1,0 +1,303 @@
+services:
+  mariadb:
+    image: mariadb:10.11.2-jammy
+    hostname: mariadb
+    container_name: mariadb
+    ports:
+      - 3306:3306
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+      MYSQL_DATABASE: metastore_db
+    networks:
+      - projectnet
+
+  hive-metastore:
+    hostname: hive-metastore
+    container_name: hive-metastore
+    image: bitsondatadev/hive-metastore:latest
+    ports:
+      - 9083:9083 # Metastore Thrift
+    volumes:
+      - ./metastore/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+    environment:
+      METASTORE_DB_HOSTNAME: mariadb
+    depends_on:
+      - mariadb
+      - mc
+    networks:
+      - projectnet
+
+  spark-iceberg:
+    image: gazetdinovir/spark-iceberg:latest
+    container_name: spark-iceberg
+    hostname: spark-iceberg
+    networks:
+      projectnet:
+    depends_on:
+      - minio
+      - hive-metastore
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - SPARK_DRIVER_MEMORY=4g
+      - SPARK_EXECUTOR_MEMORY=4g
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=iceberg
+    ports:
+      - 8888:8888  # Jupyter Notebook
+      - 8080:8080  # Spark UI
+      - 10000:10000
+      - 10001:10001
+    volumes:
+      - ./spark/notebooks:/home/iceberg/notebooks/
+      - ./spark/configs/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./spark/configs/entrypoint.sh:/spark/opt/entrypoint.sh
+
+  airflow-metadata:
+    image: postgres:17.6
+    container_name: airflow-metadata
+    hostname: airflow-metadata
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./airflow/airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "airflow" ]
+      interval: 5s
+      retries: 5
+    restart: always
+    networks:
+      - projectnet
+
+  airflow-scheduler:
+    image: my-custom-airflow:${AIRFLOW_VERSION:-2.8.3}
+    container_name: airflow-scheduler
+    hostname: airflow-scheduler
+    build:
+      context: ./airflow/docker
+      dockerfile: Dockerfile
+      args:
+        AIRFLOW_VERSION: ${AIRFLOW_VERSION:-2.8.3}
+    command: scheduler
+    healthcheck:
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"' ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-metadata:
+        condition: service_healthy
+#      airflow-init:
+#        condition: service_completed_successfully
+    env_file:
+      - airflow/airflow.env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+    networks:
+      - projectnet
+
+  airflow-webserver:
+    image: my-custom-airflow:${AIRFLOW_VERSION:-2.8.3}
+    container_name: airflow-webserver
+    hostname: airflow-webserver
+    build:
+      context: ./airflow/docker
+      dockerfile: Dockerfile
+      args:
+        AIRFLOW_VERSION: ${AIRFLOW_VERSION:-2.8.3}
+    command: webserver
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8090/health" ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-metadata:
+        condition: service_healthy
+#      airflow-init:
+#        condition: service_completed_successfully
+    env_file:
+      - airflow/airflow.env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+    ports:
+      - "8090:8080"
+    networks:
+      - projectnet
+
+#  airflow-init:
+#    image: my-custom-airflow:${AIRFLOW_VERSION:-2.8.3}
+#    container_name: airflow-init
+#    build:
+#      context: ./airflow/docker
+#      dockerfile: Dockerfile
+#      args:
+#        AIRFLOW_VERSION: ${AIRFLOW_VERSION:-2.8.3}
+#    entrypoint: /opt/airflow/scripts/entrypoint.sh
+#    user: "${AIRFLOW_UID:-50000}:0"
+#    depends_on:
+#      airflow-metadata:
+#        condition: service_healthy
+#    env_file:
+#      - airflow/airflow.env
+#    environment:
+#      _AIRFLOW_WWW_USER_USERNAME: airflow_user
+#      _AIRFLOW_WWW_USER_FIRSTNAME: Airflow
+#      _AIRFLOW_WWW_USER_LASTNAME: Admin
+#      _AIRFLOW_WWW_USER_EMAIL: airflowadmin@example.com
+#      _AIRFLOW_WWW_USER_ROLE: Admin
+#      _AIRFLOW_WWW_USER_PASSWORD: airflow_password
+#    volumes:
+#      - ./airflow/scripts:/opt/airflow/scripts
+#    networks:
+#      - projectnet
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    hostname: minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+    networks:
+      projectnet:
+    ports:
+      - 9001:9001 # MinIO Console
+      - 9000:9000 # MinIO API
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - ./minio_data:/data
+
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      projectnet:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb --ignore-existing minio/warehouse;
+      /usr/bin/mc anonymous set public minio/warehouse;
+      "
+
+  postgres_population:
+    image: postgres:17
+    container_name: postgres_population
+    hostname: postgres_population
+    networks:
+      projectnet:
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - 5432:5432
+    volumes:
+      - ./population_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino
+    hostname: trino
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./trino:/etc/trino
+    restart: unless-stopped
+    networks:
+      projectnet:
+
+  postgres_alerts:
+    image: postgres:17
+    container_name: postgres_alerts
+    hostname: postgres_alerts
+    networks:
+      projectnet:
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: alerts
+    ports:
+      - 5433:5432
+    volumes:
+      - ./alerts_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d alerts" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  superset-db:
+    image: postgres:17.6
+    container_name: superset-db
+    hostname: superset-db
+    ports:
+      - 5435:5432
+    environment:
+      POSTGRES_DB: superset
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+    volumes:
+      - ./superset/superset-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U superset -d superset" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - projectnet
+
+  superset:
+    container_name: superset
+    hostname: superset
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    environment:
+      SUPERSET_SECRET_KEY: 123456
+      DATABASE_DB: superset
+      DATABASE_HOST: superset-db
+      DATABASE_PASSWORD: superset
+      DATABASE_USER: superset
+      DATABASE_PORT: 5432
+    ports:
+      - "8089:8088"
+    depends_on:
+      superset-db:
+        condition: service_healthy
+    volumes:
+      - ./superset/superset-data:/app/superset_home
+      - ./superset/init-superset.sh:/app/init-superset.sh
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+    command: [ "sh", "/app/init-superset.sh" ]
+    networks:
+      - projectnet
+
+
+networks:
+  projectnet:
+    driver: bridge
